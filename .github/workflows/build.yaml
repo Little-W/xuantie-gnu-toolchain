@@ -1,49 +1,131 @@
 name: Build
 
 on:
+  workflow_dispatch:
   push:
     branches:
-      - master
+      - xuantie-gnu-toolchain
   pull_request:
     branches:
-      - master
+      - xuantie-gnu-toolchain
+
+env:
+  submodule_paths: |
+    binutils
+    gcc
+    gdb
+    glibc
+    llvm
+    musl
+    newlib
+    pk
+    qemu
+    spike
+    uclibc-ng
 
 jobs:
+  submodule_cache:
+    name: Initialize submodule cache
+    runs-on: ubuntu-latest
+    outputs:
+      key: ${{ steps.keygen.outputs.smcache_key }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Remove unneeded frameworks to recover disk space
+        run: sudo ./.github/cleanup-rootfs.sh
+
+      - name: Generate submodule cache key
+        id: keygen
+        run: echo "smcache_key=smcache-$(printf $(git submodule | sha1sum))" >> $GITHUB_OUTPUT
+
+      - name: Setup submodule cache
+        id: smcache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.submodule_paths }}
+          key: ${{ steps.keygen.outputs.smcache_key }}
+
+      - name: Checkout required submodules
+        if: steps.smcache.outputs.cache-hit != 'true'
+        run: git submodule update --init -j $(nproc) --depth 1 $(echo ${submodule_paths} | sed '$d' | tr '\n' ' ')
+
+      - name: Storage size optimization
+        if: steps.smcache.outputs.cache-hit != 'true'
+        run: |
+          git submodule foreach 'git maintenance run'
+
+  setup_swap:
+    name: Setup swap space
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actionhippie/swap-space@v1
+        with:
+          size: 20G
+
   build:
     runs-on: ${{ matrix.os }}
+    needs: [submodule_cache, setup_swap]
+    env:
+      smcache_key: ${{ needs.submodule_cache.outputs.key }}
     strategy:
       matrix:
-        os:     [ubuntu-18.04, ubuntu-20.04]
-        mode:   [newlib, linux]
-        target: [rv32gc-ilp32d, rv64gc-lp64d]
+        os:     [ubuntu-22.04, ubuntu-24.04]
+        mode:   [newlib]
+        compiler: [gcc]
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
 
-      - name: initialize submodules
-        run: |
-          git submodule init
-          git submodule update --recursive --progress --recommend-shallow
+      - name: Remove unneeded frameworks to recover disk space
+        run: sudo ./.github/cleanup-rootfs.sh
 
       - name: install dependencies
         run: sudo ./.github/setup-apt.sh
 
+      - name: Load submodule cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.submodule_paths }}
+          key: ${{ env.smcache_key }}
+
       - name: build toolchain
         run: |
-          TARGET_TUPLE=($(echo ${{ matrix.target }} | tr "-" "\n"))
-          ./configure --prefix=/opt/riscv --with-arch=${TARGET_TUPLE[0]} --with-abi=${TARGET_TUPLE[1]}
-          sudo make -j $(nproc) ${{ matrix.mode }}
-
-      - name: tarball build
-        run: tar czvf riscv.tar.gz -C /opt/ riscv/
+          BUILD_TOOLCHAIN="./configure --prefix=/mnt/riscv --enable-multilib --enable-libgomp"
+          if [ "${{ matrix.compiler }}" == "llvm" ]; then # build toolchain with llvm
+            $BUILD_TOOLCHAIN --enable-llvm
+          else
+            $BUILD_TOOLCHAIN
+          fi
+          sudo mkdir /mnt/riscv
+          sudo chown runner:runner /mnt/riscv
+          make -j $(nproc) ${{ matrix.mode }}
 
       - name: generate prebuilt toolchain name
         id:   toolchain-name-generator
         run: |
-          if [[ "${{ matrix.target }}" == *"32"* ]]; then BITS=32; else BITS=64; fi
-          if [[ "${{ matrix.mode }}" == "linux" ]]; then MODE="glibc"; else MODE="elf"; fi
-          echo ::set-output name=TOOLCHAIN_NAME::riscv$BITS-$MODE-${{ matrix.os }}-nightly
+          case "${{ matrix.mode }}" in
+            "linux")
+              MODE="glibc";;
+            "musl")
+              MODE="musl";;
+            "uclibc")
+              MODE="uclibc-ng";;
+            *)
+              MODE="elf";;
+          esac
+          echo "TOOLCHAIN_NAME=xuantie-$MODE-${{ matrix.os }}-${{ matrix.compiler }}-nightly" >> $GITHUB_OUTPUT
 
-      - uses: actions/upload-artifact@v2
+      - name: tarball build
+        run: |
+          du -s -h /mnt/riscv
+          ./.github/dedup-dir.sh /mnt/riscv/
+          XZ_OPT="-e -T0" tar cJvf ${{ steps.toolchain-name-generator.outputs.TOOLCHAIN_NAME }}.tar.xz -C /mnt/ riscv/
+
+      - uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.toolchain-name-generator.outputs.TOOLCHAIN_NAME }}
-          path: riscv.tar.gz
+          path: ${{ steps.toolchain-name-generator.outputs.TOOLCHAIN_NAME }}.tar.xz
+          if-no-files-found: warn
+          compression-level: 6
+          overwrite: false
+          include-hidden-files: false
